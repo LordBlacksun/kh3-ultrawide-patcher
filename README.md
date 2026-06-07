@@ -7,7 +7,7 @@
 <p><b>True 21:9 / 32:9 ultrawide for KINGDOM HEARTS III</b> — full-width Hor+, correct proportions, no stretch or zoom.</p>
 
 <p>
-  <a href="./LICENSE"><img src="https://img.shields.io/github/license/LordBlacksun/kh3-ultrawide-patcher?color=blue" alt="License: GPL-3.0" /></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-blue" alt="License: GPL-3.0" /></a>
   <a href="https://github.com/LordBlacksun/kh3-ultrawide-patcher/releases/latest"><img src="https://img.shields.io/github/v/release/LordBlacksun/kh3-ultrawide-patcher?display_name=tag" alt="Latest release" /></a>
   <a href="https://github.com/LordBlacksun/kh3-ultrawide-patcher/releases"><img src="https://img.shields.io/github/downloads/LordBlacksun/kh3-ultrawide-patcher/total" alt="Downloads" /></a>
   <img src="https://img.shields.io/badge/platform-Windows-0078D6" alt="Platform: Windows" />
