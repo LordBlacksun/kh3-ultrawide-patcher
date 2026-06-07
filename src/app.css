@@ -1,0 +1,216 @@
+/* ============================================================================
+   KH3 Ultrawide Patcher — "Dive to the Heart" nocturne theme
+   Deep stained-glass-station sky, crown-gold → deep-blue accent reserved for the
+   primary action, elegant Cormorant display over Hanken UI and JetBrains data.
+   ============================================================================ */
+
+:root {
+	/* surfaces */
+	--bg-0: #070a12;
+	--bg-1: #0a0f1e;
+	--surface: rgba(22, 30, 53, 0.66);
+	--surface-2: rgba(30, 40, 70, 0.55);
+	--surface-solid: #131b31;
+	--line: rgba(122, 144, 200, 0.16);
+	--line-strong: rgba(146, 168, 226, 0.32);
+
+	/* ink */
+	--text: #eceef8;
+	--text-dim: #9ba6c4;
+	--text-faint: #626e92;
+
+	/* accents */
+	--gold: #f4ce7b;
+	--gold-deep: #dda94b;
+	--blue: #6e86f2;
+	--blue-deep: #2e3fa6;
+	--accent: linear-gradient(135deg, #f6d27e 0%, #e7b255 26%, #6e83f0 74%, #3a4fcb 100%);
+	--accent-line: linear-gradient(90deg, transparent, rgba(244, 206, 123, 0.5), rgba(110, 134, 242, 0.5), transparent);
+
+	/* status */
+	--ok: #5fd6a6;
+	--info: #79acff;
+	--warn: #f2bc63;
+	--err: #ff7e84;
+
+	/* shape */
+	--r-sm: 9px;
+	--r-md: 13px;
+	--r-lg: 20px;
+	--r-pill: 999px;
+
+	/* depth */
+	--shadow-card: 0 28px 80px -34px rgba(0, 0, 0, 0.9), 0 1px 0 rgba(255, 255, 255, 0.03) inset;
+	--shadow-pop: 0 14px 40px -14px rgba(0, 0, 0, 0.7);
+	--glow-gold: 0 0 30px -6px rgba(244, 206, 123, 0.55);
+	--glow-blue: 0 0 30px -6px rgba(110, 134, 242, 0.5);
+
+	/* type */
+	--font-display: 'Cormorant Garamond', 'Iowan Old Style', Georgia, serif;
+	--font-ui: 'Hanken Grotesk', ui-sans-serif, system-ui, sans-serif;
+	--font-mono: 'JetBrains Mono', ui-monospace, 'Cascadia Code', monospace;
+
+	--ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+* {
+	box-sizing: border-box;
+}
+
+html,
+body {
+	margin: 0;
+	min-height: 100%;
+	background-color: var(--bg-0);
+	color: var(--text);
+	font-family: var(--font-ui);
+	font-size: 15px;
+	line-height: 1.5;
+	-webkit-font-smoothing: antialiased;
+	text-rendering: optimizeLegibility;
+	overflow-x: hidden;
+}
+
+/* Atmospheric sky: pillar glow rising from below + cool top vignette. */
+body {
+	position: relative;
+	background-image:
+		radial-gradient(1200px 720px at 50% 122%, rgba(120, 142, 235, 0.24), transparent 60%),
+		radial-gradient(880px 520px at 50% 124%, rgba(244, 206, 123, 0.13), transparent 55%),
+		radial-gradient(1000px 820px at 50% -28%, rgba(40, 54, 110, 0.42), transparent 60%),
+		linear-gradient(180deg, var(--bg-1), var(--bg-0) 72%);
+	background-attachment: fixed;
+}
+/* Starfield. */
+body::before {
+	content: '';
+	position: fixed;
+	inset: 0;
+	background-image:
+		radial-gradient(1.4px 1.4px at 18% 24%, rgba(255, 255, 255, 0.55), transparent),
+		radial-gradient(1.2px 1.2px at 72% 16%, rgba(255, 255, 255, 0.4), transparent),
+		radial-gradient(1.1px 1.1px at 38% 62%, rgba(214, 226, 255, 0.45), transparent),
+		radial-gradient(1.5px 1.5px at 86% 54%, rgba(255, 243, 214, 0.4), transparent),
+		radial-gradient(1px 1px at 60% 82%, rgba(255, 255, 255, 0.35), transparent),
+		radial-gradient(1.2px 1.2px at 8% 78%, rgba(255, 255, 255, 0.3), transparent),
+		radial-gradient(1px 1px at 28% 8%, rgba(255, 255, 255, 0.3), transparent);
+	opacity: 0.5;
+	pointer-events: none;
+	z-index: 0;
+}
+/* Fine grain. */
+body::after {
+	content: '';
+	position: fixed;
+	inset: 0;
+	background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.5'/%3E%3C/svg%3E");
+	opacity: 0.035;
+	mix-blend-mode: overlay;
+	pointer-events: none;
+	z-index: 0;
+}
+
+::selection {
+	background: rgba(244, 206, 123, 0.28);
+	color: #fff;
+}
+
+::-webkit-scrollbar {
+	width: 10px;
+	height: 10px;
+}
+::-webkit-scrollbar-track {
+	background: transparent;
+}
+::-webkit-scrollbar-thumb {
+	background: rgba(122, 144, 200, 0.22);
+	border-radius: 999px;
+	border: 2px solid transparent;
+	background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+	background: rgba(122, 144, 200, 0.42);
+	background-clip: padding-box;
+}
+
+button {
+	font-family: inherit;
+	color: inherit;
+}
+
+a {
+	color: var(--blue);
+	text-decoration: none;
+}
+a:hover {
+	color: var(--gold);
+}
+
+/* keyframes */
+@keyframes fadeUp {
+	from {
+		opacity: 0;
+		transform: translateY(12px);
+	}
+	to {
+		opacity: 1;
+		transform: none;
+	}
+}
+@keyframes fadeIn {
+	from {
+		opacity: 0;
+	}
+	to {
+		opacity: 1;
+	}
+}
+@keyframes glowPulse {
+	0%,
+	100% {
+		opacity: 0.5;
+	}
+	50% {
+		opacity: 1;
+	}
+}
+@keyframes sheen {
+	0% {
+		background-position: -160% 0;
+	}
+	55%,
+	100% {
+		background-position: 260% 0;
+	}
+}
+@keyframes spinCW {
+	to {
+		transform: rotate(360deg);
+	}
+}
+@keyframes spinCCW {
+	to {
+		transform: rotate(-360deg);
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	*,
+	*::before,
+	*::after {
+		animation-duration: 0.001ms !important;
+		animation-iteration-count: 1 !important;
+		transition-duration: 0.001ms !important;
+	}
+}
+
+/* utilities */
+.mono {
+	font-family: var(--font-mono);
+}
+.dim {
+	color: var(--text-dim);
+}
+.faint {
+	color: var(--text-faint);
+}
