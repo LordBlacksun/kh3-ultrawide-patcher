@@ -1,4 +1,20 @@
-# KH3 Ultrawide Patcher
+<div align="center">
+
+<img src="src-tauri/icons/128x128.png" width="96" height="96" alt="KH3 Ultrawide Patcher icon" />
+
+<h1>KH3 Ultrawide Patcher</h1>
+
+<p><b>True 21:9 / 32:9 ultrawide for KINGDOM HEARTS III</b> — full-width Hor+, correct proportions, no stretch or zoom.</p>
+
+<p>
+  <a href="./LICENSE"><img src="https://img.shields.io/github/license/LordBlacksun/kh3-ultrawide-patcher?color=blue" alt="License: GPL-3.0" /></a>
+  <a href="https://github.com/LordBlacksun/kh3-ultrawide-patcher/releases/latest"><img src="https://img.shields.io/github/v/release/LordBlacksun/kh3-ultrawide-patcher?display_name=tag" alt="Latest release" /></a>
+  <a href="https://github.com/LordBlacksun/kh3-ultrawide-patcher/releases"><img src="https://img.shields.io/github/downloads/LordBlacksun/kh3-ultrawide-patcher/total" alt="Downloads" /></a>
+  <img src="https://img.shields.io/badge/platform-Windows-0078D6" alt="Platform: Windows" />
+  <img src="https://img.shields.io/badge/built%20with-Tauri%20%2B%20Svelte-FFC131" alt="Built with Tauri + Svelte" />
+</p>
+
+</div>
 
 A small, elegant desktop app that patches **KINGDOM HEARTS III** (Steam & Epic, Unreal
 Engine 4) to render **true ultrawide** — full-width **21:9 / 32:9** with correct
