@@ -90,8 +90,8 @@ widen them to the same Hor+ value.
 
 ## Install
 
-### Option A — download (recommended once released)
-Grab the latest installer or portable `.exe` from the **Releases** page, run it, and
+### Option A — download (recommended)
+Grab the portable `.exe` from the **Releases** page, run it, and
 follow the three steps: **Detect → Configure → Patch**.
 
 ### Option B — build from source
