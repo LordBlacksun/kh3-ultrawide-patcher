@@ -9,7 +9,7 @@
 <p>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-blue" alt="License: GPL-3.0" /></a>
   <a href="https://github.com/LordBlacksun/kh3-ultrawide-patcher/releases/latest"><img src="https://img.shields.io/github/v/release/LordBlacksun/kh3-ultrawide-patcher?display_name=tag&cacheSeconds=3600" alt="Latest release" /></a>
-  <a href="https://github.com/LordBlacksun/kh3-ultrawide-patcher/releases"><img src="https://img.shields.io/github/downloads/LordBlacksun/kh3-ultrawide-patcher/total?cacheSeconds=3600" alt="Downloads" /></a>
+  <a href="https://github.com/LordBlacksun/kh3-ultrawide-patcher/releases"><img src="https://img.shields.io/github/downloads/LordBlacksun/kh3-ultrawide-patcher/total?cacheSeconds=300" alt="Downloads" /></a>
   <img src="https://img.shields.io/badge/platform-Windows-0078D6" alt="Platform: Windows" />
   <img src="https://img.shields.io/badge/built%20with-Tauri%20%2B%20Svelte-FFC131" alt="Built with Tauri + Svelte" />
 </p>
