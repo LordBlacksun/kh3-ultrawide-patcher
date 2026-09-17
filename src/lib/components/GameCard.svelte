@@ -14,6 +14,8 @@
 				return { label: 'Clean baseline', tone: 'ok' };
 			case 'already_patched':
 				return { label: 'Already patched', tone: 'info' };
+			case 'outdated_patch':
+				return { label: 'Older patch — update available', tone: 'warn' };
 			case 'patchable':
 				return { label: 'Unpatched', tone: 'neutral' };
 			default:

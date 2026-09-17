@@ -10,7 +10,8 @@ owners and are used here only for identification.
 - It modifies **your own, legally-owned copy** of the game executable, on your machine.
 - It **always backs up** the original executable before writing, verifies the result with a
   SHA-256 hash, and can **revert** to the exact original byte-for-byte.
-- It changes seven 4-byte values; the file size and all other bytes are unchanged.
+- It changes four 4-byte values, redirects two instructions, and places a 51-byte routine in
+  unused padding inside the executable; the file size and all other bytes are unchanged.
 - It makes **no network connections** and collects **no data**.
 
 ## No warranty

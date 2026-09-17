@@ -10,8 +10,9 @@ testing on hardware and stores the maintainer can't reach, code, and docs — ar
   single most useful thing you can report. Please open an issue with the result.
 - **Report a new game build.** If a Steam/Epic update changes the executable, the byte
   signatures may shift. Open an issue with the new build number and the state the app reports.
-- **New resolutions / aspect ratios.** The math is general (`aspect = W/H`,
-  `Hor+ FOV = 2·atan((W/H)·9/16)`), but real-world confirmation on 32:9, 48:9, etc. is helpful.
+- **New resolutions / aspect ratios.** The math is general (`aspect = W/H`; every camera's
+  `tan(FOV/2)` is scaled by `aspect × 9/16`), but real-world confirmation on 32:9, 48:9, etc. is
+  helpful.
 - **Code & docs.** Bug fixes, clarity, accessibility, and packaging improvements.
 
 ## Development setup
@@ -31,9 +32,9 @@ npm run tauri build    # produce an installer + portable exe
   - Rust: `cargo test --manifest-path src-tauri/Cargo.toml`
   - Frontend: `npm run check` (svelte-check — must be 0 errors / 0 warnings)
 - **The patch byte-table is safety-critical.** Any change touching `src-tauri/src/model.rs`
-  or `src-tauri/src/patch.rs` must keep the **golden test byte-for-byte**. The golden test
-  rebuilds the known patched executable from a clean baseline; run it against your own
-  legally-owned copy (PowerShell):
+  or `src-tauri/src/patch.rs` must keep the **golden tests byte-for-byte**. They rebuild the
+  known patched executable from a clean baseline and from v1.0.x-patched builds; run them
+  against your own legally-owned copy (PowerShell):
   ```powershell
   $env:KH3_EXE_COPY = "C:\path\to\a\clean\KINGDOM HEARTS III.exe"   # a COPY you own — never commit it
   cargo test --manifest-path src-tauri/Cargo.toml

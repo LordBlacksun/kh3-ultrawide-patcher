@@ -47,10 +47,7 @@
 				: PRESETS[presetIdx].h
 	);
 
-	// fov + flags
-	let fovMode = $state<'auto' | 'custom'>('auto');
-	let fovCustom = $state(106);
-	let advanced = $state(false);
+	// flags
 	let force = $state(false);
 
 	// computed / plan
@@ -71,9 +68,13 @@
 		phase === 'detect' ? 0 : phase === 'options' ? 1 : phase === 'working' ? 2 : 3
 	);
 	let is16_9 = $derived(computed?.is16_9 ?? false);
-	let planToPatch = $derived(plan ? plan.sites.filter((s) => s.state === 'patch').length : 0);
+	let planToPatch = $derived(
+		plan ? plan.sites.filter((s) => s.state === 'patch' && s.kind !== 'restore').length : 0
+	);
+	let planLegacy = $derived(
+		plan ? plan.sites.filter((s) => s.state === 'patch' && s.kind === 'restore').length : 0
+	);
 	let planAlready = $derived(plan ? plan.sites.filter((s) => s.state === 'already').length : 0);
-	let planSkipped = $derived(plan ? plan.sites.filter((s) => s.state === 'skipped').length : 0);
 	let customAspect = $derived(height > 0 ? width / height : 0);
 	let dimsValid = $derived(
 		width >= 1024 &&
@@ -91,8 +92,6 @@
 		return {
 			width,
 			height,
-			fovDegrees: fovMode === 'custom' ? fovCustom : null,
-			includeAdvanced: advanced,
 			force
 		};
 	}
@@ -172,23 +171,22 @@
 		game = g;
 	}
 
-	// Live aspect/FOV preview (cheap, no file I/O).
+	// Live aspect preview (cheap, no file I/O).
 	$effect(() => {
 		const w = width;
 		const h = height;
-		const fov = fovMode === 'custom' ? fovCustom : null;
 		if (phase !== 'options') return;
 		const gen = ++computeGen;
 		ipc
-			.compute(w, h, fov)
+			.compute(w, h)
 			.then((c) => {
 				if (gen === computeGen) computed = c;
 			})
 			.catch(() => {});
 	});
 
-	// Plan (reads the exe) — only depends on the install, resolution's 16:9-ness,
-	// and the advanced toggle. Debounced so it doesn't re-read on every keystroke.
+	// Plan (reads the exe) — only depends on the install and resolution's 16:9-ness.
+	// Debounced so it doesn't re-read on every keystroke.
 	let planTimer: ReturnType<typeof setTimeout> | null = null;
 	let planGen = 0;
 	let computeGen = 0;
@@ -196,7 +194,6 @@
 		const g = game;
 		const w = width;
 		const h = height;
-		const adv = advanced;
 		if (phase !== 'options' || !g) return;
 		if (planTimer) clearTimeout(planTimer);
 		planning = true;
@@ -206,8 +203,6 @@
 				const p = await ipc.planPatch(g.exePath, {
 					width: w,
 					height: h,
-					fovDegrees: null,
-					includeAdvanced: adv,
 					force: true
 				});
 				if (gen === planGen) plan = p;
@@ -410,26 +405,10 @@
 				{/if}
 
 				<div class="group">
-					<div class="group-h"><span>Field of view</span></div>
-					<div class="seg" role="group" aria-label="Field of view mode">
-						<button class:on={fovMode === 'auto'} aria-pressed={fovMode === 'auto'} onclick={() => (fovMode = 'auto')}>
-							Hor+ (recommended)
-						</button>
-						<button class:on={fovMode === 'custom'} aria-pressed={fovMode === 'custom'} onclick={() => (fovMode = 'custom')}>Custom</button>
+					<div class="group-h">
+						<span>Field of view</span>
+						<span class="ratio">Hor+ · every camera</span>
 					</div>
-					{#if fovMode === 'custom'}
-						<div class="slider">
-							<input
-								type="range"
-								min="70"
-								max="130"
-								step="0.5"
-								aria-label="Field of view in degrees"
-								bind:value={fovCustom}
-							/>
-							<span class="sv mono">{Number(fovCustom).toFixed(1)}°</span>
-						</div>
-					{/if}
 					{#if computed}
 						<div class="readout">
 							<div>
@@ -438,26 +417,16 @@
 								<span class="hexchip mono">{computed.aspectHex}</span>
 							</div>
 							<div>
-								<span class="rk">FOV</span>
-								<span class="rv mono">
-									{(fovMode === 'custom' ? Number(fovCustom) : computed.fovDeg).toFixed(2)}°
-								</span>
-								<span class="hexchip mono">{fovMode === 'custom' ? 'custom' : computed.fovHex}</span>
+								<span class="rk">90° camera</span>
+								<span class="rv mono">{computed.horPlus90Deg.toFixed(2)}°</span>
 							</div>
 						</div>
 					{/if}
+					<p class="muted small fov-note">
+						Gameplay, team attacks and cutscenes keep their 16:9 framing top to bottom and gain
+						extra width at the sides.
+					</p>
 				</div>
-
-				<label class="adv">
-					<input type="checkbox" bind:checked={advanced} />
-					<span>
-						<b>Also widen combat &amp; team-attack cameras</b><br />
-						<span class="muted small">
-							Experimental — reduces extra zoom during link/team attacks and unlocked-camera
-							moments. Off by default; some shots may be intentionally tight.
-						</span>
-					</span>
-				</label>
 
 				<div class="plan">
 					{#if planning}
@@ -466,11 +435,13 @@
 						<span class="err-text">{plan.abortReason}</span>
 					{:else if plan}
 						<span class="muted small">
-							{#if planToPatch > 0}<b class="gold">{planToPatch}</b> site{planToPatch === 1
+							{#if planToPatch > 0}<b class="gold">{planToPatch}</b> edit{planToPatch === 1
 									? ''
-									: 's'} to patch{/if}
-							{#if planAlready > 0} · {planAlready} already done{/if}
-							{#if planSkipped > 0} · {planSkipped} skipped{/if}
+									: 's'} to apply{/if}
+							{#if planLegacy > 0}{planToPatch > 0 ? ' · ' : ''}<b class="gold">{planLegacy}</b> older-version
+								edit{planLegacy === 1 ? '' : 's'} to replace{/if}
+							{#if planAlready > 0}{planToPatch + planLegacy > 0 ? ' · ' : ''}{planAlready} already
+								done{/if}
 						</span>
 					{/if}
 				</div>
@@ -482,7 +453,9 @@
 							? 'Pick an ultrawide resolution'
 							: !dimsValid
 								? 'Enter a valid resolution'
-								: 'Apply ultrawide patch'}
+								: planToPatch === 0 && planLegacy > 0
+									? 'Update older patch'
+									: 'Apply ultrawide patch'}
 					</button>
 				</div>
 			</section>
@@ -848,21 +821,9 @@
 		border-color: var(--line-strong);
 	}
 
-	.slider {
-		display: flex;
-		align-items: center;
-		gap: 14px;
-		margin-top: 14px;
-	}
-	.slider input[type='range'] {
-		flex: 1;
-		accent-color: var(--gold);
-	}
-	.sv {
-		font-size: 14px;
-		color: var(--gold);
-		min-width: 58px;
-		text-align: right;
+	.fov-note {
+		margin: 12px 0 0;
+		line-height: 1.5;
 	}
 
 	.readout {
@@ -894,28 +855,6 @@
 		padding: 2px 8px;
 		border-radius: 6px;
 		letter-spacing: 0.06em;
-	}
-
-	.adv {
-		display: flex;
-		gap: 12px;
-		align-items: flex-start;
-		padding: 14px 16px;
-		border: 1px solid var(--line);
-		border-radius: var(--r-md);
-		background: rgba(255, 255, 255, 0.02);
-		cursor: pointer;
-	}
-	.adv input {
-		margin-top: 3px;
-		accent-color: var(--gold);
-		width: 16px;
-		height: 16px;
-		flex-shrink: 0;
-	}
-	.adv b {
-		font-weight: 600;
-		font-size: 13.5px;
 	}
 
 	.plan {

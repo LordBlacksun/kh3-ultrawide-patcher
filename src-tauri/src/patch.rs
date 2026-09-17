@@ -1,5 +1,4 @@
 //! The patch core: compute values, plan, apply, revert, verify, back up.
-//! A faithful Rust port of the proven `patch-ultrawide.ps1` algorithm.
 
 use crate::error::{AppError, AppResult};
 use crate::model::*;
@@ -38,28 +37,19 @@ pub fn to_hex(b: &[u8]) -> String {
 // Value computation
 // ---------------------------------------------------------------------------
 
-/// Compute the aspect + Hor+ FOV bytes for a target resolution.
-/// `fov_override`: `Some(d)` with d>0 forces an explicit FOV; otherwise auto Hor+.
-pub fn compute_values(width: u32, height: u32, fov_override: Option<f64>) -> ComputedValues {
+/// Compute the aspect bytes for a target resolution (+ the Hor+ angle of a 90° camera, for display).
+pub fn compute_values(width: u32, height: u32) -> ComputedValues {
     let (w, h) = (width.max(1), height.max(1));
     let aspect = w as f32 / h as f32;
     let aspect_bytes = aspect.to_le_bytes();
     let is_16_9 = (aspect - (16.0_f32 / 9.0_f32)).abs() < 1.0e-4;
-
-    let fov_deg = match fov_override {
-        // Guard the safety boundary: only accept a finite, sane custom FOV; otherwise auto Hor+.
-        Some(f) if f.is_finite() && f > 0.0 && f <= 170.0 => f,
-        _ => 2.0 * ((w as f64 / h as f64) * 9.0 / 16.0).atan() * 180.0 / std::f64::consts::PI,
-    };
-    let fov_bytes = (fov_deg as f32).to_le_bytes();
+    let hor_plus_90_deg = (2.0 * ((w as f64 / h as f64) * 9.0 / 16.0).atan()).to_degrees();
 
     ComputedValues {
         aspect,
         aspect_bytes,
         aspect_hex: to_hex(&aspect_bytes),
-        fov_deg,
-        fov_bytes,
-        fov_hex: to_hex(&fov_bytes),
+        hor_plus_90_deg,
         is_16_9,
     }
 }
@@ -86,8 +76,7 @@ fn validate_dims(width: u32, height: u32) -> Option<String> {
 // Byte search
 // ---------------------------------------------------------------------------
 
-/// All start offsets of `pat` in `hay` (overlapping, step 1 — parity with the
-/// PowerShell reference; only matters for diagnostics since patterns are unique).
+/// All start offsets of `pat` in `hay` (overlapping, step 1).
 pub fn find_all(hay: &[u8], pat: &[u8]) -> Vec<usize> {
     let mut res = Vec::new();
     if pat.is_empty() || pat.len() > hay.len() {
@@ -108,57 +97,344 @@ pub fn find_all(hay: &[u8], pat: &[u8]) -> Vec<usize> {
     res
 }
 
+/// Parse a byte pattern like `"F3 0F ?? 28"`; `??` matches any byte.
+pub fn parse_pattern(spec: &str) -> Vec<Option<u8>> {
+    spec.split_whitespace()
+        .map(|t| if t == "??" { None } else { Some(u8::from_str_radix(t, 16).expect("bad pattern byte")) })
+        .collect()
+}
+
+/// All start offsets where `pat` matches. Anchors on the longest run of fixed bytes.
+pub fn find_pattern(hay: &[u8], pat: &[Option<u8>]) -> Vec<usize> {
+    let (mut anchor_at, mut anchor_len, mut i) = (0, 0, 0);
+    while i < pat.len() {
+        let s = i;
+        while i < pat.len() && pat[i].is_some() {
+            i += 1;
+        }
+        if i - s > anchor_len {
+            anchor_at = s;
+            anchor_len = i - s;
+        }
+        i += 1;
+    }
+    if anchor_len == 0 || pat.len() > hay.len() {
+        return Vec::new();
+    }
+    let anchor: Vec<u8> = pat[anchor_at..anchor_at + anchor_len].iter().map(|b| b.unwrap()).collect();
+    find_all(hay, &anchor)
+        .into_iter()
+        .filter_map(|a| a.checked_sub(anchor_at))
+        .filter(|&s| {
+            s + pat.len() <= hay.len() && pat.iter().enumerate().all(|(k, p)| p.map_or(true, |v| hay[s + k] == v))
+        })
+        .collect()
+}
+
+fn read_i32(b: &[u8], o: usize) -> Option<i32> {
+    b.get(o..o + 4).map(|s| i32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+fn read_u32(b: &[u8], o: usize) -> Option<u32> {
+    b.get(o..o + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+fn read_u16(b: &[u8], o: usize) -> Option<u16> {
+    b.get(o..o + 2).map(|s| u16::from_le_bytes([s[0], s[1]]))
+}
+
+/// Little-endian rel32 from the end of an instruction (`next`) to `target`.
+fn rel32(next: u32, target: u32) -> [u8; 4] {
+    ((target as i64 - next as i64) as i32).to_le_bytes()
+}
+
+// ---------------------------------------------------------------------------
+// PE image (just enough to map offsets, find .text and the .pdata function table)
+// ---------------------------------------------------------------------------
+
+struct Section {
+    name: [u8; 8],
+    va: u32,
+    raw_ptr: u32,
+    raw_size: u32,
+}
+
+struct PeImage {
+    sections: Vec<Section>,
+    exception_rva: u32,
+    exception_size: u32,
+}
+
+impl PeImage {
+    fn parse(b: &[u8]) -> Option<Self> {
+        if b.get(0..2)? != b"MZ" {
+            return None;
+        }
+        let pe = read_u32(b, 0x3C)? as usize;
+        if b.get(pe..pe + 4)? != b"PE\0\0" {
+            return None;
+        }
+        let nsec = read_u16(b, pe + 6)? as usize;
+        let opt_size = read_u16(b, pe + 20)? as usize;
+        let opt = pe + 24;
+        if read_u16(b, opt)? != 0x20B {
+            return None; // not PE32+
+        }
+        let exception_dir = opt + 112 + 3 * 8;
+        let mut sections = Vec::with_capacity(nsec);
+        for i in 0..nsec {
+            let o = opt + opt_size + i * 40;
+            sections.push(Section {
+                name: b.get(o..o + 8)?.try_into().ok()?,
+                va: read_u32(b, o + 12)?,
+                raw_size: read_u32(b, o + 16)?,
+                raw_ptr: read_u32(b, o + 20)?,
+            });
+        }
+        Some(PeImage {
+            sections,
+            exception_rva: read_u32(b, exception_dir)?,
+            exception_size: read_u32(b, exception_dir + 4)?,
+        })
+    }
+
+    fn off_to_rva(&self, off: usize) -> Option<u32> {
+        let off = off as u64;
+        self.sections
+            .iter()
+            .find(|s| off >= s.raw_ptr as u64 && off < s.raw_ptr as u64 + s.raw_size as u64)
+            .map(|s| s.va + (off - s.raw_ptr as u64) as u32)
+    }
+
+    fn rva_to_off(&self, rva: u32) -> Option<usize> {
+        self.sections
+            .iter()
+            .find(|s| rva >= s.va && rva - s.va < s.raw_size)
+            .map(|s| (s.raw_ptr + (rva - s.va)) as usize)
+    }
+
+    fn section(&self, name: &[u8]) -> Option<&Section> {
+        self.sections.iter().find(|s| s.name.split(|&c| c == 0).next() == Some(name))
+    }
+
+    /// (begin, end) RVAs of every function in the exception directory (.pdata).
+    fn functions(&self, b: &[u8]) -> Vec<(u32, u32)> {
+        let Some(start) = self.rva_to_off(self.exception_rva) else {
+            return Vec::new();
+        };
+        (0..self.exception_size as usize / 12)
+            .filter_map(|i| Some((read_u32(b, start + i * 12)?, read_u32(b, start + i * 12 + 4)?)))
+            .filter(|&(begin, _)| begin != 0)
+            .collect()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Planning
 // ---------------------------------------------------------------------------
 
-fn plan_site(bytes: &[u8], e: &EditDescriptor) -> (SitePlan, Option<String>) {
+fn site(name: &str, group: &str, kind: EditKind) -> SitePlan {
+    SitePlan {
+        name: name.to_string(),
+        group: group.to_string(),
+        kind,
+        offset: None,
+        state: SiteState::Abort,
+        count: 0,
+        writes: Vec::new(),
+    }
+}
+
+fn plan_aspect(bytes: &[u8], e: &EditDescriptor, computed: &ComputedValues) -> (SitePlan, Option<String>) {
     let mut pat = Vec::with_capacity(e.prefix.len() + 4);
     pat.extend_from_slice(e.prefix);
     pat.extend_from_slice(&e.old);
     let hits = find_all(bytes, &pat);
-    let count = hits.len();
-
-    let (state, offset, abort) = if count == 1 {
-        (SiteState::Patch, Some((hits[0] + e.prefix.len()) as u64), None)
-    } else if count == 0 {
-        // Required: nothing to do (already patched). Optional: simply not present.
-        (
-            if e.optional { SiteState::Skipped } else { SiteState::Already },
-            None,
-            None,
-        )
-    } else if e.optional {
-        (SiteState::Skipped, None, None)
-    } else {
-        (
-            SiteState::Abort,
-            None,
+    let mut sp = site(e.name, &e.group.to_string(), EditKind::Aspect);
+    sp.count = hits.len();
+    match hits.len() {
+        1 => {
+            let off = hits[0] + e.prefix.len();
+            sp.state = SiteState::Patch;
+            sp.offset = Some(off as u64);
+            sp.writes = vec![(off, computed.aspect_bytes.to_vec())];
+            (sp, None)
+        }
+        0 => {
+            sp.state = SiteState::Already;
+            (sp, None)
+        }
+        n => (
+            sp,
             Some(format!(
                 "Site '{}': expected exactly one occurrence of [{}]; found {}. Aborting (build may be unexpected).",
                 e.name,
                 to_hex(&pat),
-                count
+                n
             )),
-        )
-    };
+        ),
+    }
+}
 
-    (
-        SitePlan {
-            name: e.name.to_string(),
-            group: e.group.to_string(),
-            optional: e.optional,
-            kind: e.kind,
-            offset,
-            state,
-            count,
-        },
-        abort,
-    )
+/// The two leaf routines + the 9/16 constant, placed at RVA `cave`.
+/// post_c: tan *= ViewInfo.AspectRatio * 9/16, then the displaced `movss xmm6,[1.0]`.
+/// post_u: tan *= xmm11 (W/H, or 1) * 9/16, then the displaced `movaps xmm1,xmm6 ; mov [rbp-4Dh],0`.
+fn projection_routines(cave: u32, one_rva: u32) -> Vec<u8> {
+    let (post_u, k) = (cave + PROJ_POST_U_OFFSET, cave + PROJ_CONST_OFFSET);
+    let mut v = Vec::with_capacity(PROJ_ROUTINE_LEN);
+    v.extend_from_slice(&[0xF3, 0x0F, 0x59, 0x43, 0x28]); // mulss xmm0, [rbx+28h]
+    v.extend_from_slice(&[0xF3, 0x0F, 0x59, 0x05]); // mulss xmm0, [rip -> 9/16]
+    v.extend_from_slice(&rel32(cave + 13, k));
+    v.extend_from_slice(&[0xF3, 0x0F, 0x10, 0x35]); // movss xmm6, [rip -> 1.0]
+    v.extend_from_slice(&rel32(cave + 21, one_rva));
+    v.push(0xC3); // ret
+    v.extend_from_slice(&[0xF3, 0x41, 0x0F, 0x59, 0xC3]); // mulss xmm0, xmm11
+    v.extend_from_slice(&[0xF3, 0x0F, 0x59, 0x05]); // mulss xmm0, [rip -> 9/16]
+    v.extend_from_slice(&rel32(post_u + 13, k));
+    v.extend_from_slice(&[0x0F, 0x28, 0xCE]); // movaps xmm1, xmm6
+    v.extend_from_slice(&[0x48, 0xC7, 0x45, 0xB3, 0x00, 0x00, 0x00, 0x00]); // mov qword [rbp-4Dh], 0
+    v.push(0xC3); // ret
+    v.extend_from_slice(&(9.0_f32 / 16.0).to_le_bytes());
+    debug_assert_eq!(v.len(), PROJ_ROUTINE_LEN);
+    v
+}
+
+/// Start RVA for the routines: inside the int3 run (>= PROJ_MIN_PADDING bytes, outside every
+/// .pdata function) nearest to `near_rva`.
+fn find_padding(bytes: &[u8], pe: &PeImage, near_rva: u32) -> Option<u32> {
+    let text = pe.section(b".text")?;
+    let base = text.raw_ptr as usize;
+    let data = bytes.get(base..base + text.raw_size as usize)?;
+    let functions = pe.functions(bytes);
+    let mut best: Option<(u64, u32)> = None;
+    let mut i = 0;
+    while let Some(p) = memchr::memchr(0xCC, &data[i..]) {
+        let start = i + p;
+        let mut end = start;
+        while end < data.len() && data[end] == 0xCC {
+            end += 1;
+        }
+        i = end;
+        if end - start < PROJ_MIN_PADDING {
+            continue;
+        }
+        let (r0, r1) = (text.va + start as u32, text.va + end as u32);
+        if functions.iter().any(|&(begin, fn_end)| begin < r1 && fn_end > r0) {
+            continue;
+        }
+        let distance = (r0 as i64 - near_rva as i64).unsigned_abs();
+        if best.map_or(true, |(d, _)| distance < d) {
+            best = Some((distance, r0));
+        }
+    }
+    best.map(|(_, r0)| r0 + PROJ_PADDING_LEAD)
+}
+
+fn window_contains(bytes: &[u8], start: usize, needle: &[u8]) -> bool {
+    let end = (start + PROJ_CHECK_WINDOW).min(bytes.len());
+    bytes.get(start..end).map_or(false, |w| memchr::memmem::find(w, needle).is_some())
+}
+
+fn holds_one(bytes: &[u8], pe: &PeImage, rva: u32) -> bool {
+    pe.rva_to_off(rva).and_then(|o| bytes.get(o..o + 4)) == Some(&1.0_f32.to_le_bytes()[..])
+}
+
+fn plan_projection(bytes: &[u8]) -> (SitePlan, Option<String>) {
+    let mut sp = site("Hor+ projection fix (every camera)", "P", EditKind::Projection);
+    let unrecognized = |sp: SitePlan, why: &str| {
+        (sp, Some(format!("Hor+ projection fix: {why}. Aborting (build may be unexpected).")))
+    };
+    let Some(pe) = PeImage::parse(bytes) else {
+        return unrecognized(sp, "not a 64-bit Windows executable");
+    };
+    let c_old = find_pattern(bytes, &parse_pattern(PROJ_CONSTRAINED_OLD));
+    let u_old = find_pattern(bytes, &parse_pattern(PROJ_UNCONSTRAINED_OLD));
+    let c_new = find_pattern(bytes, &parse_pattern(PROJ_CONSTRAINED_NEW));
+    let u_new = find_pattern(bytes, &parse_pattern(PROJ_UNCONSTRAINED_NEW));
+    sp.count = c_old.len() + u_old.len() + c_new.len() + u_new.len();
+
+    if c_old.len() == 1 && u_old.len() == 1 && c_new.is_empty() && u_new.is_empty() {
+        let (c_site, u_site) = (c_old[0] + PROJ_SITE_OFFSET, u_old[0] + PROJ_SITE_OFFSET);
+        if !window_contains(bytes, c_old[0], PROJ_CHECK_CONSTRAINED)
+            || !window_contains(bytes, u_old[0], PROJ_CHECK_UNCONSTRAINED)
+        {
+            return unrecognized(sp, "projection code layout differs from the known build");
+        }
+        let (Some(c_rva), Some(u_rva), Some(disp)) =
+            (pe.off_to_rva(c_site), pe.off_to_rva(u_site), read_i32(bytes, c_site + 4))
+        else {
+            return unrecognized(sp, "sites outside the image");
+        };
+        let one_rva = (c_rva as i64 + 8 + disp as i64) as u32;
+        if !holds_one(bytes, &pe, one_rva) {
+            return unrecognized(sp, "displaced instruction doesn't load 1.0");
+        }
+        let Some((cave, cave_off)) = find_padding(bytes, &pe, c_rva).and_then(|r| Some((r, pe.rva_to_off(r)?))) else {
+            return unrecognized(sp, "no unused padding for the routines");
+        };
+        let mut call_c = vec![0xE8];
+        call_c.extend_from_slice(&rel32(c_rva + 5, cave));
+        call_c.extend_from_slice(&[0x0F, 0x1F, 0x00]);
+        let mut call_u = vec![0xE8];
+        call_u.extend_from_slice(&rel32(u_rva + 5, cave + PROJ_POST_U_OFFSET));
+        call_u.extend_from_slice(&[0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00]);
+        sp.state = SiteState::Patch;
+        sp.offset = Some(c_site as u64);
+        sp.writes = vec![(cave_off, projection_routines(cave, one_rva)), (c_site, call_c), (u_site, call_u)];
+        return (sp, None);
+    }
+
+    if c_new.len() == 1 && u_new.len() == 1 && c_old.is_empty() && u_old.is_empty() {
+        let (c_site, u_site) = (c_new[0] + PROJ_SITE_OFFSET, u_new[0] + PROJ_SITE_OFFSET);
+        let already = (|| {
+            let (c_rva, u_rva) = (pe.off_to_rva(c_site)?, pe.off_to_rva(u_site)?);
+            let cave = (c_rva as i64 + 5 + read_i32(bytes, c_site + 1)? as i64) as u32;
+            let cave_u = (u_rva as i64 + 5 + read_i32(bytes, u_site + 1)? as i64) as u32;
+            let cave_off = pe.rva_to_off(cave)?;
+            let one_rva = (cave as i64 + 21 + read_i32(bytes, cave_off + 17)? as i64) as u32;
+            Some(
+                cave_u == cave + PROJ_POST_U_OFFSET
+                    && holds_one(bytes, &pe, one_rva)
+                    && bytes.get(cave_off..cave_off + PROJ_ROUTINE_LEN) == Some(&projection_routines(cave, one_rva)[..]),
+            )
+        })();
+        if already == Some(true) {
+            sp.state = SiteState::Already;
+            sp.offset = Some(c_site as u64);
+            return (sp, None);
+        }
+        return unrecognized(sp, "patched call sites don't lead to the expected routines");
+    }
+
+    unrecognized(sp, "projection code not found")
+}
+
+/// Edits left by older patcher versions: restored only when the surrounding bytes match exactly
+/// once and the value between them isn't the original. Never aborts.
+fn plan_restores(bytes: &[u8]) -> Vec<SitePlan> {
+    let mut out = Vec::new();
+    for r in LEGACY_RESTORES {
+        let mut values = find_all(bytes, r.prefix)
+            .into_iter()
+            .map(|p| p + r.prefix.len())
+            .filter(|&v| bytes.get(v + 4..v + 4 + r.suffix.len()) == Some(r.suffix));
+        let (Some(v), None) = (values.next(), values.next()) else {
+            continue;
+        };
+        if bytes[v..v + 4] != r.original {
+            let mut sp = site(r.name, "R", EditKind::Restore);
+            sp.state = SiteState::Patch;
+            sp.offset = Some(v as u64);
+            sp.count = 1;
+            sp.writes = vec![(v, r.original.to_vec())];
+            out.push(sp);
+        }
+    }
+    out
 }
 
 pub fn build_plan(bytes: &[u8], opt: &PatchOptions) -> PatchPlan {
-    let computed = compute_values(opt.width, opt.height, opt.fov_degrees);
+    let computed = compute_values(opt.width, opt.height);
 
     if let Some(reason) = validate_dims(opt.width, opt.height) {
         return PatchPlan {
@@ -181,44 +457,38 @@ pub fn build_plan(bytes: &[u8], opt: &PatchOptions) -> PatchPlan {
     }
 
     let mut sites = Vec::new();
-    let mut will_write = false;
     let mut abort_reason: Option<String> = None;
-
-    let consider = |edits: &[EditDescriptor], sites: &mut Vec<SitePlan>, will_write: &mut bool, abort_reason: &mut Option<String>| {
-        for e in edits {
-            let (sp, ab) = plan_site(bytes, e);
-            if sp.state == SiteState::Patch {
-                *will_write = true;
-            }
-            if abort_reason.is_none() {
-                if let Some(reason) = ab {
-                    *abort_reason = Some(reason);
-                }
-            }
-            sites.push(sp);
+    for e in ASPECT_EDITS {
+        let (sp, ab) = plan_aspect(bytes, e, &computed);
+        if abort_reason.is_none() {
+            abort_reason = ab;
         }
-    };
-
-    consider(DEFAULT_EDITS, &mut sites, &mut will_write, &mut abort_reason);
-    if opt.include_advanced {
-        consider(ADVANCED_EDITS, &mut sites, &mut will_write, &mut abort_reason);
+        sites.push(sp);
     }
 
-    // All-or-nothing for REQUIRED sites: a mix of patchable + already-done means an
+    // All-or-nothing for the aspect edits: a mix of patchable + already-done means an
     // unexpected/partially-modified build. Writing only the matching sites would leave
     // the game stretched (group A alone), so abort instead of silently half-patching.
     if abort_reason.is_none() {
-        let req_patch = sites.iter().filter(|s| !s.optional && s.state == SiteState::Patch).count();
-        let req_already = sites.iter().filter(|s| !s.optional && s.state == SiteState::Already).count();
-        if req_patch > 0 && req_already > 0 {
+        let patch = sites.iter().filter(|s| s.state == SiteState::Patch).count();
+        let already = sites.iter().filter(|s| s.state == SiteState::Already).count();
+        if patch > 0 && already > 0 {
             abort_reason = Some(format!(
-                "Unexpected or partially-modified build: {} of {} required patch sites are present but {} are missing. Refusing to write a partial patch (it would leave the game stretched). Restore the original exe (Steam/Epic → Verify integrity of game files) and try again.",
-                req_patch,
-                req_patch + req_already,
-                req_already
+                "Unexpected or partially-modified build: {} of {} aspect edit sites are present but {} are missing. Refusing to write a partial patch (it would leave the game stretched). Restore the original exe (Steam/Epic → Verify integrity of game files) and try again.",
+                patch,
+                patch + already,
+                already
             ));
         }
     }
+
+    let (projection, ab) = plan_projection(bytes);
+    if abort_reason.is_none() {
+        abort_reason = ab;
+    }
+    sites.push(projection);
+    sites.extend(plan_restores(bytes));
+    let will_write = sites.iter().any(|s| s.state == SiteState::Patch);
 
     PatchPlan {
         computed,
@@ -385,27 +655,31 @@ pub fn inspect(exe: &Path, store: Store, backup_root: &Path) -> AppResult<GameIn
     let sha256 = sha256_bytes(&bytes);
     let is_baseline = size == BASELINE_SIZE && sha256.eq_ignore_ascii_case(BASELINE_SHA);
 
+    // The resolution only affects the values written, not which sites are pending.
+    let plan = build_plan(&bytes, &PatchOptions { width: 3440, height: 1440, force: true });
+    let aspect_done = plan
+        .sites
+        .iter()
+        .filter(|s| s.kind == EditKind::Aspect)
+        .all(|s| s.state == SiteState::Already);
+    let projection_done = plan
+        .sites
+        .iter()
+        .any(|s| s.kind == EditKind::Projection && s.state == SiteState::Already);
+    let legacy_edits = plan
+        .sites
+        .iter()
+        .filter(|s| s.kind == EditKind::Restore && s.state == SiteState::Patch)
+        .count();
+
     let state = if is_baseline {
         ExeState::CleanBaseline
-    } else if sha256.eq_ignore_ascii_case(PATCHED_3440_SHA) {
+    } else if aspect_done && projection_done && legacy_edits == 0 {
         ExeState::AlreadyPatched
+    } else if aspect_done {
+        ExeState::OutdatedPatch
     } else {
-        let mut any_old = false;
-        for e in DEFAULT_EDITS {
-            let mut pat = Vec::with_capacity(e.prefix.len() + 4);
-            pat.extend_from_slice(e.prefix);
-            pat.extend_from_slice(&e.old);
-            if !find_all(&bytes, &pat).is_empty() {
-                any_old = true;
-                break;
-            }
-        }
-        if any_old {
-            ExeState::Patchable
-        } else {
-            // No required original values remain → effectively already patched.
-            ExeState::AlreadyPatched
-        }
+        ExeState::Patchable
     };
 
     let backup_path = existing_backup(backup_root, exe);
@@ -416,6 +690,7 @@ pub fn inspect(exe: &Path, store: Store, backup_root: &Path) -> AppResult<GameIn
         sha256,
         is_baseline,
         state,
+        legacy_edits,
         backup_present: backup_path.is_some(),
         backup_path,
         on_protected_path: is_protected_path(exe),
@@ -485,67 +760,47 @@ pub fn apply(exe: &Path, opt: &PatchOptions, backup_root: &Path) -> AppResult<Pa
             matches_known_patched: sha_before.eq_ignore_ascii_case(PATCHED_3440_SHA),
             applied: plan.sites.clone(),
             backup_path: existing_backup(backup_root, exe),
-            message: "All target sites are already patched — no changes made.".to_string(),
+            message: "All edits are already in place — no changes made.".to_string(),
         });
     }
 
     let backup_path = backup_if_baseline(exe, &sha_before, is_baseline, backup_root)?;
 
+    let pending = || plan.sites.iter().filter(|s| s.state == SiteState::Patch);
     let mut patched = bytes;
-    for sp in &plan.sites {
-        if sp.state == SiteState::Patch {
-            if let Some(off) = sp.offset {
-                let off = off as usize;
-                let nb = match sp.kind {
-                    EditKind::Aspect => plan.computed.aspect_bytes,
-                    EditKind::Fov => plan.computed.fov_bytes,
-                };
-                patched[off..off + 4].copy_from_slice(&nb);
-            }
-        }
+    for (off, data) in pending().flat_map(|s| s.writes.iter()) {
+        patched[*off..*off + data.len()].copy_from_slice(data);
     }
 
     atomic_write_replace(exe, &patched)?;
 
-    // Verify.
+    // Verify: every write landed, and a fresh plan of the result has nothing left to do.
     let after = std::fs::read(exe)?;
     let size_after = after.len() as u64;
     let sha_after = sha256_bytes(&after);
-    let mut residual_required = 0usize;
-    for e in DEFAULT_EDITS {
-        let mut pat = Vec::with_capacity(e.prefix.len() + 4);
-        pat.extend_from_slice(e.prefix);
-        pat.extend_from_slice(&e.old);
-        residual_required += find_all(&after, &pat).len();
-    }
-    // Positively confirm every planned write actually landed (default AND advanced sites) —
-    // not merely that the old bytes are gone.
-    let mut writes_confirmed = true;
-    for sp in &plan.sites {
-        if sp.state == SiteState::Patch {
-            if let Some(off) = sp.offset {
-                let off = off as usize;
-                let expected = match sp.kind {
-                    EditKind::Aspect => plan.computed.aspect_bytes,
-                    EditKind::Fov => plan.computed.fov_bytes,
-                };
-                if off + 4 > after.len() || after[off..off + 4] != expected {
-                    writes_confirmed = false;
-                }
-            }
-        }
-    }
+    let writes_confirmed = pending()
+        .flat_map(|s| s.writes.iter())
+        .all(|(off, data)| after.get(*off..*off + data.len()) == Some(data.as_slice()));
+    let replan = build_plan(&after, opt);
+    let residual_required = replan.sites.iter().filter(|s| s.state != SiteState::Already).count();
     let size_unchanged = size_after == size_before;
-    let ok = size_unchanged && residual_required == 0 && writes_confirmed;
-    let patched_count = plan.sites.iter().filter(|s| s.state == SiteState::Patch).count();
+    let ok = size_unchanged && writes_confirmed && residual_required == 0 && replan.abort_reason.is_none();
+    let restored = pending().filter(|s| s.kind == EditKind::Restore).count();
+    let patched_count = pending().count() - restored;
 
-    let message = if ok {
-        format!(
-            "Patched {} site(s). True {}×{} ultrawide (Hor+, FOV {:.2}°). Launch Borderless Fullscreen at {}×{}.",
-            patched_count, opt.width, opt.height, plan.computed.fov_deg, opt.width, opt.height
-        )
-    } else {
+    let message = if !ok {
         "Verification was unexpected — consider reverting and re-checking.".to_string()
+    } else if patched_count == 0 {
+        format!("Undid {restored} edit(s) left by an older patcher version. Your ultrawide patch is otherwise unchanged.")
+    } else {
+        let mut m = format!(
+            "Patched {} edit(s). True {}×{} ultrawide with Hor+ on every camera. Launch at {}×{} (Borderless Fullscreen, or Fullscreen when HDR is on).",
+            patched_count, opt.width, opt.height, opt.width, opt.height
+        );
+        if restored > 0 {
+            m.push_str(&format!(" Also replaced {restored} edit(s) from an older patcher version."));
+        }
+        m
     };
 
     Ok(PatchReport {
@@ -660,165 +915,338 @@ pub fn revert(exe: &Path, backup_root: &Path) -> AppResult<PatchReport> {
 mod tests {
     use super::*;
 
-    fn opt(w: u32, h: u32, advanced: bool) -> PatchOptions {
-        PatchOptions { width: w, height: h, fov_degrees: None, include_advanced: advanced, force: true }
+    fn opt(w: u32, h: u32) -> PatchOptions {
+        PatchOptions { width: w, height: h, force: true }
+    }
+
+    fn put_u16(b: &mut [u8], o: usize, v: u16) {
+        b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+    }
+
+    fn put_u32(b: &mut [u8], o: usize, v: u32) {
+        b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// A pattern's bytes with wildcards as zero.
+    fn concrete(spec: &str) -> Vec<u8> {
+        parse_pattern(spec).into_iter().map(|b| b.unwrap_or(0)).collect()
+    }
+
+    const SYN_C: usize = 0x1100;
+    const SYN_U: usize = 0x1200;
+    const SYN_ONE: u32 = 0x2000;
+    const SYN_RUN: u32 = 0x1800;
+
+    /// Minimal PE32+ image, file offsets == RVAs: .text @0x1000, .rdata @0x2000, .pdata @0x3000.
+    /// Holds the 4 aspect sites, both projection sites with their follow-up checks, the 1.0
+    /// constant, a 0x100-byte int3 run at 0x1800, and one .pdata function over 0x1000..0x1300.
+    fn synth_exe() -> Vec<u8> {
+        let mut b = vec![0u8; 0x3100];
+        b[0x1000..0x2000].fill(0x90);
+        b[0..2].copy_from_slice(b"MZ");
+        put_u32(&mut b, 0x3C, 0x80);
+        b[0x80..0x84].copy_from_slice(b"PE\0\0");
+        put_u16(&mut b, 0x86, 3);
+        put_u16(&mut b, 0x94, 0xF0);
+        let opt = 0x98;
+        put_u16(&mut b, opt, 0x20B);
+        put_u32(&mut b, opt + 112 + 24, 0x3000);
+        put_u32(&mut b, opt + 112 + 28, 12);
+        for (i, (name, va, size)) in [(b".text\0\0\0", 0x1000u32, 0x1000u32), (b".rdata\0\0", 0x2000, 0x1000), (b".pdata\0\0", 0x3000, 0x100)]
+            .iter()
+            .enumerate()
+        {
+            let o = opt + 0xF0 + i * 40;
+            b[o..o + 8].copy_from_slice(&name[..]);
+            put_u32(&mut b, o + 8, *size);
+            put_u32(&mut b, o + 12, *va);
+            put_u32(&mut b, o + 16, *size);
+            put_u32(&mut b, o + 20, *va);
+        }
+        for (i, e) in ASPECT_EDITS.iter().enumerate().skip(1) {
+            let o = 0x1010 + i * 0x20;
+            b[o..o + e.prefix.len()].copy_from_slice(e.prefix);
+            b[o + e.prefix.len()..o + e.prefix.len() + 4].copy_from_slice(&e.old);
+        }
+        b[0x2010..0x2014].copy_from_slice(&OLD_RENDER_169);
+        b[SYN_ONE as usize..SYN_ONE as usize + 4].copy_from_slice(&1.0_f32.to_le_bytes());
+        let c = concrete(PROJ_CONSTRAINED_OLD);
+        b[SYN_C..SYN_C + c.len()].copy_from_slice(&c);
+        let movss = SYN_C + PROJ_SITE_OFFSET;
+        b[movss + 4..movss + 8].copy_from_slice(&rel32(movss as u32 + 8, SYN_ONE));
+        b[SYN_C + 0x40..SYN_C + 0x40 + PROJ_CHECK_CONSTRAINED.len()].copy_from_slice(PROJ_CHECK_CONSTRAINED);
+        let u = concrete(PROJ_UNCONSTRAINED_OLD);
+        b[SYN_U..SYN_U + u.len()].copy_from_slice(&u);
+        b[SYN_U + 0x40..SYN_U + 0x40 + PROJ_CHECK_UNCONSTRAINED.len()].copy_from_slice(PROJ_CHECK_UNCONSTRAINED);
+        b[SYN_RUN as usize..SYN_RUN as usize + 0x100].fill(0xCC);
+        put_u32(&mut b, 0x3000, 0x1000);
+        put_u32(&mut b, 0x3004, 0x1300);
+        b
+    }
+
+    fn temp_exe(tag: &str, data: &[u8]) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("kh3uw_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("KINGDOM HEARTS III.exe");
+        std::fs::write(&exe, data).unwrap();
+        let backups = dir.join("backups");
+        (dir, exe, backups)
     }
 
     #[test]
     fn computed_byte_table() {
-        let c = compute_values(3440, 1440, None);
+        let c = compute_values(3440, 1440);
         assert_eq!(c.aspect_bytes, [0x8E, 0xE3, 0x18, 0x40], "3440x1440 aspect");
-        assert_eq!(c.fov_bytes, [0x25, 0x60, 0xD5, 0x42], "3440x1440 Hor+ FOV");
         assert!(!c.is_16_9);
-        assert!((c.fov_deg - 106.69).abs() < 0.1, "fov ~106.69, got {}", c.fov_deg);
+        assert!((c.hor_plus_90_deg - 106.69).abs() < 0.01, "90° camera -> 106.69°, got {}", c.hor_plus_90_deg);
 
         // 16:9 resolutions short-circuit and never produce the DANGER bytes via a write.
-        assert!(compute_values(1920, 1080, None).is_16_9);
-        assert!(compute_values(2560, 1440, None).is_16_9);
-        assert_eq!(compute_values(1920, 1080, None).aspect_bytes, DANGER_UI);
+        assert!(compute_values(1920, 1080).is_16_9);
+        assert!(compute_values(2560, 1440).is_16_9);
+        assert_eq!(compute_values(1920, 1080).aspect_bytes, DANGER_UI);
 
         // Aspect-sharing presets compute identical bytes.
-        assert_eq!(
-            compute_values(2560, 1080, None).aspect_bytes,
-            compute_values(5120, 2160, None).aspect_bytes
-        );
-    }
-
-    /// Build a synthetic buffer containing each given edit's (prefix ++ old)
-    /// exactly once, separated by filler that can't form a pattern.
-    fn synth(edits: &[&EditDescriptor]) -> Vec<u8> {
-        let mut v = vec![0x90u8; 8];
-        for e in edits {
-            v.extend_from_slice(e.prefix);
-            v.extend_from_slice(&e.old);
-            v.extend_from_slice(&[0x90u8; 8]);
-        }
-        v
+        assert_eq!(compute_values(2560, 1080).aspect_bytes, compute_values(5120, 2160).aspect_bytes);
     }
 
     #[test]
-    fn plan_all_default_sites_patch() {
-        let refs: Vec<&EditDescriptor> = DEFAULT_EDITS.iter().collect();
-        let buf = synth(&refs);
-        let plan = build_plan(&buf, &opt(3440, 1440, false));
-        assert!(plan.abort_reason.is_none());
+    fn pattern_wildcards() {
+        let p = parse_pattern("AA ?? CC");
+        assert_eq!(find_pattern(&[0x00, 0xAA, 0x01, 0xCC, 0xAA, 0x02, 0xCC], &p), vec![1, 4]);
+        assert!(find_pattern(&[0xAA, 0x01, 0xCD], &p).is_empty());
+        assert!(find_pattern(&[0xAA], &p).is_empty());
+    }
+
+    #[test]
+    fn projection_routines_layout() {
+        let r = projection_routines(0x1808, 0x2000);
+        assert_eq!(r.len(), PROJ_ROUTINE_LEN);
+        assert_eq!(r[21], 0xC3, "post_c ends with ret");
+        assert_eq!(r[46], 0xC3, "post_u ends with ret");
+        assert_eq!(&r[47..], &(9.0_f32 / 16.0).to_le_bytes());
+        // RIP-relative references resolve to the constant and to 1.0.
+        assert_eq!(0x1808 + 13 + read_i32(&r, 9).unwrap() as i64, 0x1808 + PROJ_CONST_OFFSET as i64);
+        assert_eq!(0x1808 + 21 + read_i32(&r, 17).unwrap() as i64, 0x2000);
+        assert_eq!(0x1808 + 22 + 13 + read_i32(&r, 31).unwrap() as i64, 0x1808 + PROJ_CONST_OFFSET as i64);
+    }
+
+    #[test]
+    fn fresh_exe_plans_aspect_and_projection() {
+        let b = synth_exe();
+        let plan = build_plan(&b, &opt(3440, 1440));
+        assert!(plan.abort_reason.is_none(), "{:?}", plan.abort_reason);
         assert!(plan.will_write);
-        assert_eq!(plan.sites.len(), 7);
-        assert!(plan.sites.iter().all(|s| s.state == SiteState::Patch));
+        let aspect: Vec<_> = plan.sites.iter().filter(|s| s.kind == EditKind::Aspect).collect();
+        assert_eq!(aspect.len(), 4);
+        assert!(aspect.iter().all(|s| s.state == SiteState::Patch));
+        let proj = plan.sites.iter().find(|s| s.kind == EditKind::Projection).unwrap();
+        assert_eq!(proj.state, SiteState::Patch);
+        let cave = SYN_RUN + PROJ_PADDING_LEAD;
+        assert_eq!(proj.writes[0], (cave as usize, projection_routines(cave, SYN_ONE)));
+        let site_c = SYN_C + PROJ_SITE_OFFSET;
+        assert_eq!(proj.writes[1].0, site_c);
+        assert_eq!(proj.writes[1].1[0], 0xE8);
+        assert_eq!(site_c as i64 + 5 + read_i32(&proj.writes[1].1, 1).unwrap() as i64, cave as i64);
+        let site_u = SYN_U + PROJ_SITE_OFFSET;
+        assert_eq!(proj.writes[2].0, site_u);
+        assert_eq!(proj.writes[2].1.len(), 11);
+        assert_eq!(site_u as i64 + 5 + read_i32(&proj.writes[2].1, 1).unwrap() as i64, (cave + PROJ_POST_U_OFFSET) as i64);
+        assert!(plan.sites.iter().all(|s| s.kind != EditKind::Restore));
+    }
+
+    #[test]
+    fn apply_verifies_and_rerun_is_already() {
+        let (dir, exe, backups) = temp_exe("apply", &synth_exe());
+        let report = apply(&exe, &opt(3440, 1440), &backups).unwrap();
+        assert!(report.ok, "apply should verify ok: {}", report.message);
+        assert_eq!(report.residual_required, 0);
+        assert!(report.size_unchanged);
+
+        let after = std::fs::read(&exe).unwrap();
+        let plan = build_plan(&after, &opt(3440, 1440));
+        assert!(plan.abort_reason.is_none(), "{:?}", plan.abort_reason);
+        assert!(plan.sites.iter().all(|s| s.state == SiteState::Already));
+
+        let again = apply(&exe, &opt(3440, 1440), &backups).unwrap();
+        assert!(again.ok);
+        assert!(again.message.to_lowercase().contains("already"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn plan_16_9_is_noop() {
-        let refs: Vec<&EditDescriptor> = DEFAULT_EDITS.iter().collect();
-        let buf = synth(&refs);
-        let plan = build_plan(&buf, &opt(2560, 1440, false));
+        let plan = build_plan(&synth_exe(), &opt(2560, 1440));
         assert!(plan.no_change_16_9);
         assert!(!plan.will_write);
     }
 
     #[test]
     fn required_duplicate_aborts() {
-        let refs: Vec<&EditDescriptor> = DEFAULT_EDITS.iter().collect();
-        let mut buf = synth(&refs);
-        // Append a second copy of the bare render-aspect value (a required site).
-        buf.extend_from_slice(&OLD_RENDER_169);
-        buf.extend_from_slice(&[0x90u8; 8]);
-        let plan = build_plan(&buf, &opt(3440, 1440, false));
-        assert!(plan.abort_reason.is_some(), "duplicate required site must abort");
+        let mut b = synth_exe();
+        // A second copy of the bare render-aspect value.
+        b[0x2020..0x2024].copy_from_slice(&OLD_RENDER_169);
+        assert!(build_plan(&b, &opt(3440, 1440)).abort_reason.is_some(), "duplicate aspect site must abort");
     }
 
     #[test]
-    fn optional_duplicate_skips_not_aborts() {
-        let mut refs: Vec<&EditDescriptor> = DEFAULT_EDITS.iter().collect();
-        refs.extend(ADVANCED_EDITS.iter());
-        let mut buf = synth(&refs);
-        // Duplicate one advanced site's pattern.
-        let adv = &ADVANCED_EDITS[0];
-        buf.extend_from_slice(adv.prefix);
-        buf.extend_from_slice(&adv.old);
-        buf.extend_from_slice(&[0x90u8; 8]);
-        let plan = build_plan(&buf, &opt(3440, 1440, true));
-        assert!(plan.abort_reason.is_none(), "optional duplicate must not abort");
-        let dup = plan.sites.iter().find(|s| s.name == adv.name).unwrap();
-        assert_eq!(dup.state, SiteState::Skipped);
+    fn partial_aspect_build_aborts() {
+        // Only the bare render aspect (group A) is left; the camera sites are gone →
+        // mixed states must abort instead of writing a stretched partial patch.
+        let mut b = synth_exe();
+        b[0x1010..0x1100].fill(0x90);
+        assert!(build_plan(&b, &opt(3440, 1440)).abort_reason.is_some(), "partial aspect build must abort");
     }
 
     #[test]
-    fn apply_and_verify_on_synthetic_file() {
-        let refs: Vec<&EditDescriptor> = DEFAULT_EDITS.iter().collect();
-        let buf = synth(&refs);
-        let tmp_dir = std::env::temp_dir().join(format!("kh3uw_test_{}", std::process::id()));
-        std::fs::create_dir_all(&tmp_dir).unwrap();
-        let exe = tmp_dir.join("fake.exe");
-        std::fs::write(&exe, &buf).unwrap();
-        let backup_root = tmp_dir.join("backups");
+    fn unrecognized_projection_code_aborts() {
+        let mut b = synth_exe();
+        b[SYN_U + 0x40] = 0x90; // the unconstrained follow-up check no longer matches
+        let plan = build_plan(&b, &opt(3440, 1440));
+        assert!(plan.abort_reason.as_deref().unwrap_or("").contains("projection"), "{:?}", plan.abort_reason);
 
-        let report = apply(&exe, &opt(3440, 1440, false), &backup_root).unwrap();
-        assert!(report.ok, "apply should verify ok: {}", report.message);
-        assert_eq!(report.residual_required, 0);
-        assert!(report.size_unchanged);
-
-        // Re-applying is idempotent → already patched, no write.
-        let again = apply(&exe, &opt(3440, 1440, false), &backup_root).unwrap();
-        assert!(again.ok);
-        assert!(again.message.to_lowercase().contains("already"));
-
-        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let mut b = synth_exe();
+        b[SYN_C..SYN_C + 4].fill(0x90); // constrained site gone
+        assert!(build_plan(&b, &opt(3440, 1440)).abort_reason.is_some());
     }
 
     #[test]
-    fn partial_required_build_aborts() {
-        // Only the bare render-aspect (group A) is present; the camera sites are absent →
-        // mixed required states must abort instead of writing a stretched partial patch.
-        let mut buf = vec![0x90u8; 8];
-        buf.extend_from_slice(&OLD_RENDER_169);
-        buf.extend_from_slice(&[0x90u8; 8]);
-        let plan = build_plan(&buf, &opt(3440, 1440, false));
-        assert!(plan.abort_reason.is_some(), "mixed required sites must abort");
+    fn padding_inside_a_function_is_never_used() {
+        let mut b = synth_exe();
+        put_u32(&mut b, 0x3004, 0x2000); // the .pdata function now covers the int3 run
+        let plan = build_plan(&b, &opt(3440, 1440));
+        assert!(plan.abort_reason.as_deref().unwrap_or("").contains("padding"), "{:?}", plan.abort_reason);
+    }
+
+    #[test]
+    fn outdated_patch_is_upgraded() {
+        // Aspect edits already applied by v1.0.x, projection fix missing, and a v1.0 FOV edit
+        // still holding its widened value.
+        let mut b = synth_exe();
+        let aspect = compute_values(3440, 1440).aspect_bytes;
+        for s in build_plan(&b, &opt(3440, 1440)).sites.iter().filter(|s| s.kind == EditKind::Aspect) {
+            let o = s.offset.unwrap() as usize;
+            b[o..o + 4].copy_from_slice(&aspect);
+        }
+        let legacy = &LEGACY_RESTORES[0];
+        let o = 0x1400;
+        b[o..o + legacy.prefix.len()].copy_from_slice(legacy.prefix);
+        let v = o + legacy.prefix.len();
+        b[v..v + 4].copy_from_slice(&106.69_f32.to_le_bytes());
+        b[v + 4..v + 4 + legacy.suffix.len()].copy_from_slice(legacy.suffix);
+
+        let plan = build_plan(&b, &opt(3440, 1440));
+        assert!(plan.abort_reason.is_none(), "{:?}", plan.abort_reason);
+        assert!(plan.sites.iter().filter(|s| s.kind == EditKind::Aspect).all(|s| s.state == SiteState::Already));
+        assert!(plan.sites.iter().any(|s| s.kind == EditKind::Projection && s.state == SiteState::Patch));
+        assert_eq!(plan.sites.iter().filter(|s| s.kind == EditKind::Restore).count(), 1);
+
+        let (dir, exe, backups) = temp_exe("upgrade", &b);
+        assert_eq!(inspect(&exe, Store::Manual, &backups).unwrap().state, ExeState::OutdatedPatch);
+        let report = apply(&exe, &opt(3440, 1440), &backups).unwrap();
+        assert!(report.ok, "{}", report.message);
+        let after = std::fs::read(&exe).unwrap();
+        assert_eq!(after[v..v + 4], OLD_FOV_90, "legacy FOV edit restored to 90.0");
+        let info = inspect(&exe, Store::Manual, &backups).unwrap();
+        assert_eq!(info.state, ExeState::AlreadyPatched);
+        assert_eq!(info.legacy_edits, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A legacy edit context with `value` between prefix and suffix.
+    fn legacy(r: &RestoreDescriptor, value: [u8; 4]) -> Vec<u8> {
+        let mut v = r.prefix.to_vec();
+        v.extend_from_slice(&value);
+        v.extend_from_slice(r.suffix);
+        v.extend_from_slice(&[0x90u8; 8]);
+        v
+    }
+
+    #[test]
+    fn restore_needs_one_changed_context() {
+        let wide = 106.69_f32.to_le_bytes();
+        let r = &LEGACY_RESTORES[3];
+        assert_eq!(plan_restores(&legacy(r, wide)).len(), 1);
+        // Still the original value → nothing to restore.
+        assert!(plan_restores(&legacy(r, OLD_FOV_90)).is_empty());
+        // Context present twice → ambiguous → leave both alone.
+        assert!(plan_restores(&[legacy(r, wide), legacy(r, wide)].concat()).is_empty());
+        // Prefix without its suffix → not the edit site.
+        let mut no_suffix = r.prefix.to_vec();
+        no_suffix.extend_from_slice(&wide);
+        no_suffix.extend_from_slice(&[0x90u8; 24]);
+        assert!(plan_restores(&no_suffix).is_empty());
     }
 
     #[test]
     fn invalid_dimensions_abort() {
-        assert!(build_plan(&[0u8; 16], &opt(99999, 1440, false)).abort_reason.is_some());
-        assert!(build_plan(&[0u8; 16], &opt(1, 1440, false)).abort_reason.is_some());
-        assert!(build_plan(&[0u8; 16], &opt(3840, 100, false)).abort_reason.is_some());
+        assert!(build_plan(&[0u8; 16], &opt(99999, 1440)).abort_reason.is_some());
+        assert!(build_plan(&[0u8; 16], &opt(1, 1440)).abort_reason.is_some());
+        assert!(build_plan(&[0u8; 16], &opt(3840, 100)).abort_reason.is_some());
     }
 
-    /// Real-bytes golden test. Set `KH3_EXE_COPY` to a CLEAN baseline exe (e.g. the
-    /// project's `_backup\*.orig`). The file is copied to a temp dir and never
-    /// modified in place. Skips silently when the env var is unset, so normal
-    /// `cargo test` and CI stay machine-independent and PII-free.
+    /// The clean baseline from `KH3_EXE_COPY` (e.g. the project's `_backup\*.orig`), or None to
+    /// skip. Normal `cargo test` and CI stay machine-independent and PII-free.
+    fn real_baseline(test: &str) -> Option<Vec<u8>> {
+        let Some(src) = std::env::var_os("KH3_EXE_COPY") else {
+            eprintln!("{test}: KH3_EXE_COPY not set — skipping");
+            return None;
+        };
+        let base = std::fs::read(&src).expect("KH3_EXE_COPY unreadable");
+        assert_eq!(sha256_bytes(&base), BASELINE_SHA, "KH3_EXE_COPY must be the clean baseline");
+        Some(base)
+    }
+
+    /// Real-bytes golden test: patching the clean baseline at 3440x1440 must reproduce the
+    /// in-game-validated build byte-for-byte, and revert must restore the baseline.
     #[test]
     fn golden_real_exe() {
-        let Some(src) = std::env::var_os("KH3_EXE_COPY") else {
-            eprintln!("golden_real_exe: KH3_EXE_COPY not set — skipping");
-            return;
-        };
-        let src = std::path::PathBuf::from(src);
-        assert!(src.exists(), "KH3_EXE_COPY does not exist: {}", src.display());
+        let Some(base) = real_baseline("golden_real_exe") else { return };
+        let (dir, exe, backups) = temp_exe("golden", &base);
+        assert_eq!(inspect(&exe, Store::Manual, &backups).unwrap().state, ExeState::CleanBaseline);
 
-        let tmp_dir = std::env::temp_dir().join(format!("kh3uw_golden_{}", std::process::id()));
-        std::fs::create_dir_all(&tmp_dir).unwrap();
-        let exe = tmp_dir.join("KINGDOM HEARTS III.exe");
-        std::fs::copy(&src, &exe).unwrap();
-        let backup_root = tmp_dir.join("backups");
-
-        assert_eq!(
-            sha256_file(&exe).unwrap(),
-            BASELINE_SHA,
-            "source must be the clean baseline"
-        );
-
-        // Patch 3440x1440 (auto Hor+) → must reproduce the golden patched build byte-for-byte.
-        let rep = apply(&exe, &opt(3440, 1440, false), &backup_root).unwrap();
+        let rep = apply(&exe, &opt(3440, 1440), &backups).unwrap();
         assert!(rep.ok, "patch verify failed: {}", rep.message);
         assert_eq!(rep.sha_after, PATCHED_3440_SHA, "patched bytes must match golden SHA");
         assert!(rep.matches_known_patched);
+        assert_eq!(inspect(&exe, Store::Manual, &backups).unwrap().state, ExeState::AlreadyPatched);
 
-        // Revert → back to the clean baseline.
-        let rev = revert(&exe, &backup_root).unwrap();
+        let rev = revert(&exe, &backups).unwrap();
         assert_eq!(rev.sha_after, BASELINE_SHA, "revert must restore the baseline");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-        let _ = std::fs::remove_dir_all(&tmp_dir);
+    /// v1.0.x's 3440x1440 build (FOV constant edits instead of the projection fix).
+    const LEGACY_V10X_3440_SHA: &str = "1EABCFFB09AE443521B42868E02EA126E3B346D48A859DB1021642891DA2FBBC";
+
+    /// Real-bytes: builds patched by v1.0.x (1EABCFFB) and by v1.0.0 with its camera option ticked
+    /// (5CF3CF63…, seen in the field) must both upgrade to exactly the golden build.
+    #[test]
+    fn golden_real_exe_upgrades_older_builds() {
+        let Some(base) = real_baseline("golden_real_exe_upgrades_older_builds") else { return };
+        let (aspect, old_fov) = ([0x8E, 0xE3, 0x18, 0x40], [0x25, 0x60, 0xD5, 0x42]);
+        let mut v10x = base.clone();
+        for off in [0x65675C8usize, 0x3FA1D5B, 0x3FA3212, 0x3FA1DA8] {
+            v10x[off..off + 4].copy_from_slice(&aspect);
+        }
+        for off in [0x3FA1D3Cusize, 0x3FA1D97, 0x3FA3208] {
+            v10x[off..off + 4].copy_from_slice(&old_fov);
+        }
+        assert_eq!(sha256_bytes(&v10x), LEGACY_V10X_3440_SHA, "fixture must reproduce the v1.0.x build");
+        let mut v100_camera_option = v10x.clone();
+        for off in [0x360A604usize, 0x4028EB3] {
+            v100_camera_option[off..off + 4].copy_from_slice(&old_fov);
+        }
+        assert!(sha256_bytes(&v100_camera_option).starts_with("5CF3CF63"), "fixture must reproduce the v1.0.0 build");
+
+        for (tag, data, legacy_edits) in [("v10x", &v10x, 3), ("v100cam", &v100_camera_option, 5)] {
+            let (dir, exe, backups) = temp_exe(tag, data);
+            let info = inspect(&exe, Store::Manual, &backups).unwrap();
+            assert_eq!(info.state, ExeState::OutdatedPatch, "{tag}");
+            assert_eq!(info.legacy_edits, legacy_edits, "{tag}");
+            let rep = apply(&exe, &opt(3440, 1440), &backups).unwrap();
+            assert!(rep.ok, "{tag}: {}", rep.message);
+            assert_eq!(rep.sha_after, PATCHED_3440_SHA, "{tag} must upgrade to the golden build");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
