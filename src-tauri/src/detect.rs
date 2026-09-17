@@ -37,12 +37,13 @@ pub fn detect_all() -> DetectResult {
 }
 
 /// Rank an install for auto-selection when several are found: prefer a clean baseline,
-/// then a patchable build, then an already-patched one, then an unknown build.
+/// then a patchable build, then one with an older patch to update, then an already-patched one.
 fn state_rank(s: ExeState) -> u8 {
     match s {
         ExeState::CleanBaseline => 0,
         ExeState::Patchable => 1,
-        ExeState::AlreadyPatched => 2,
+        ExeState::OutdatedPatch => 2,
+        ExeState::AlreadyPatched => 3,
     }
 }
 

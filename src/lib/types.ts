@@ -1,9 +1,9 @@
 // Mirrors the serde structs returned by the Rust backend (see src-tauri/src/model.rs).
 
 export type Store = 'steam' | 'epic' | 'manual' | 'unknown';
-export type ExeState = 'clean_baseline' | 'already_patched' | 'patchable';
-export type SiteState = 'patch' | 'already' | 'abort' | 'skipped';
-export type EditKind = 'aspect' | 'fov';
+export type ExeState = 'clean_baseline' | 'already_patched' | 'outdated_patch' | 'patchable';
+export type SiteState = 'patch' | 'already' | 'abort';
+export type EditKind = 'aspect' | 'projection' | 'restore';
 
 export interface GameInfo {
 	store: Store;
@@ -12,6 +12,8 @@ export interface GameInfo {
 	sha256: string;
 	isBaseline: boolean;
 	state: ExeState;
+	/** Edits left by an older patcher version (restored by the next patch). */
+	legacyEdits: number;
 	backupPresent: boolean;
 	backupPath: string | null;
 	onProtectedPath: boolean;
@@ -29,16 +31,14 @@ export interface ComputedValues {
 	aspect: number;
 	aspectBytes: number[];
 	aspectHex: string;
-	fovDeg: number;
-	fovBytes: number[];
-	fovHex: string;
+	/** Horizontal angle a 90° camera renders at with the Hor+ fix. */
+	horPlus90Deg: number;
 	is16_9: boolean;
 }
 
 export interface SitePlan {
 	name: string;
 	group: string;
-	optional: boolean;
 	kind: EditKind;
 	offset: number | null;
 	state: SiteState;
@@ -70,8 +70,6 @@ export interface PatchReport {
 export interface PatchOptions {
 	width: number;
 	height: number;
-	fovDegrees?: number | null;
-	includeAdvanced: boolean;
 	force: boolean;
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "kh3-ultrawide-patcher"
-version = "1.0.0"
+version = "1.1.0"
 description = "Ultrawide patcher for KINGDOM HEARTS III (Steam & Epic)"
 authors = ["kh3-ultrawide-patcher contributors"]
 license = "GPL-3.0-only"

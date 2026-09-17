@@ -4,7 +4,7 @@
 
 <h1>KH3 Ultrawide Patcher</h1>
 
-<p><b>True 21:9 / 32:9 ultrawide for KINGDOM HEARTS III</b> — full-width Hor+, correct proportions, no stretch or zoom.</p>
+<p><b>True 21:9 / 32:9 ultrawide for KINGDOM HEARTS III</b> — full-width, Hor+ on every camera, no stretch or zoom.</p>
 
 <p>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-blue" alt="License: GPL-3.0" /></a>
@@ -18,11 +18,11 @@
 
 A small, elegant desktop app that patches **KINGDOM HEARTS III** (Steam & Epic, Unreal
 Engine 4) to render **true ultrawide** — full-width **21:9 / 32:9** with correct
-proportions (**Hor+**, no stretch, no zoom) instead of pillarboxing a 16:9 image into
-black bars.
+proportions and **Hor+ on every camera** (exploring, combat, team attacks, in-engine
+cutscenes) instead of pillarboxing a 16:9 image into black bars.
 
-It finds your install on its own, backs up the executable, applies seven 4‑byte float
-edits, verifies the result, and reverts in one click.
+It finds your install on its own, backs up the executable, applies four aspect-ratio edits
+plus a small Hor+ projection fix, verifies the result, and reverts in one click.
 
 > Built with Tauri 2 + Svelte. No telemetry, no network access — everything runs locally.
 
@@ -31,7 +31,7 @@ edits, verifies the result, and reverts in one click.
 ## Screenshots
 
 The whole flow is three steps — **Detect → Configure → Patch**. The Configure step lets you
-choose your resolution three ways, with the correct Hor+ FOV computed for you:
+choose your resolution three ways:
 
 **Presets** — common 21:9 and 32:9 resolutions:
 
@@ -54,37 +54,48 @@ choose your resolution three ways, with the correct Hor+ FOV computed for you:
   **manual browse** fallback.
 - **Common ultrawide presets** — 2560×1080, 3440×1440, 3840×1600, 5120×2160 (21:9),
   3840×1080, 5120×1440 (32:9) — plus **auto-detect my display** and **custom W×H**.
-- **Correct math for any resolution:** aspect = `W/H`; Hor+ FOV = `2·atan((W/H)·9/16)`.
+- **Hor+ on every camera, any resolution:** aspect = `W/H`, and every camera's view is widened
+  at render time so it keeps the vertical framing it has at 16:9.
 - **Safe by construction:** automatic backup (to `%LOCALAPPDATA%`), SHA-256 verification,
   idempotent re-runs, and one-click **revert** to the exact original.
-- **Optional (off by default):** also widen the combat / team-attack cameras.
+- **Updates older patches:** executables patched by v1.0.x are detected and upgraded in place.
 - **16:9-aware:** picking a 16:9 resolution is a no-op (nothing is written).
 
 ---
 
 ## How it works — the fix
 
-KH3 has no native ultrawide; it hard-codes 16:9 in three independent places. The patch is
-**seven 4-byte little-endian float overwrites** — the file size and every other byte are
-unchanged. Each site is located by a unique byte signature and patched only if present
-(so re-running is harmless).
+KH3 has no native ultrawide. Two things have to change, and the file size stays the same.
 
-| group | what | before | after (example: 3440×1440) |
+**1. Aspect ratio — four 4-byte float edits.** The game hard-codes 16:9 for its output and
+its cameras:
+
+| edit | what | before | after (example: 3440×1440) |
 |---|---|---|---|
 | output / render aspect (×1) | frame fills the screen | `AC 8B E3 3F` (1.7778) | `8E E3 18 40` (2.38889) |
 | camera projection aspect (×3) | correct proportions, no stretch | `3B 8E E3 3F` (1.7778) | `8E E3 18 40` (2.38889) |
-| camera FOV (×3) | Hor+, no zoom | `00 00 B4 42` (90°) | `25 60 D5 42` (106.69°) |
 
-The stored FOV is **horizontal**, so constraining the aspect to ultrawide trims the
-*vertical* view unless the FOV is widened — widening it back to the angle that preserves
-the original 16:9 vertical view gives true **Hor+** framing. The famous single
-"`AC 8B E3 3F`" community edit is only the first group, which is why it *stretches*; the
-camera aspect and FOV groups are the missing halves.
+The famous single "`AC 8B E3 3F`" community edit is only the first of these, which is why it
+*stretches*.
 
-**Advanced (opt-in):** six further FOV writes cover the team/link-attack and
-unlocked-camera shots, which zoom in a little more on the default 7-edit patch. They are
-left at 90° by default because some may be intentionally tight; enable the checkbox to
-widen them to the same Hor+ value.
+**2. Hor+ on every camera — the projection fix.** KH3's camera FOVs are *horizontal*, and they
+come from game data: the regular camera uses 100°, special attacks 40–110°, and in-engine
+cutscenes change FOV with every shot. On a wider screen each camera keeps its horizontal view
+and loses height, which looks zoomed in — about 1.34× at 21:9 and 2× at 32:9. Instead of chasing
+individual values, the patch fixes the one place every FOV passes through, Unreal's
+`FMinimalViewInfo::CalculateProjectionMatrixGivenView`: right after it computes `tan(FOV/2)`,
+the result is scaled by `aspect × 9/16`. Every camera then shows exactly the vertical framing its
+FOV has at 16:9, with the extra width at the sides. (At 16:9 the factor is 1 — no change.)
+
+In bytes: the instruction after each of the function's two `call tanf` sites is replaced by a
+call to a tiny leaf routine that multiplies the tangent and re-executes the instruction it
+displaced. The two routines and their constant (51 bytes) go into unused int3 padding in the
+executable. Every site is located by byte signature; if anything doesn't match exactly once, the
+patch aborts without writing.
+
+v1.0.x widened three camera FOV constants instead, which only reached cameras that use the
+engine's default FOV. v1.1.0 restores those values when it updates an older patch, so no camera
+is widened twice.
 
 ---
 
@@ -126,11 +137,11 @@ verify it however reassures you:
 ## Using it
 
 1. **Detect** — the app locates your KH3 install and shows the executable, its state
-   (clean / already patched / unknown build), and whether a backup exists.
-2. **Configure** — pick a resolution preset (or your display / a custom size) and, if you
-   like, a custom FOV. The default FOV is the recommended Hor+ value.
+   (clean / already patched / older patch to update / unknown build), and whether a backup exists.
+2. **Configure** — pick a resolution preset (or your display / a custom size).
 3. **Patch** — the original exe is backed up, the edits are applied, and the result is
-   verified. In game, set **Borderless Fullscreen** at your chosen resolution.
+   verified. In game, set **Borderless Fullscreen** at your chosen resolution. (With the game's
+   HDR setting on, KH3 only offers **Fullscreen** — that works just as well.)
 
 **Revert** at any time restores the exact original executable from the backup.
 
@@ -158,6 +169,13 @@ thus undo the patch). Just run the patcher again — it’s idempotent and re-ap
   not a bug.** They're native pre-rendered video files, not real-time rendering, so the patch
   can't widen them; stretching them would distort faces and logos. In-engine (real-time)
   cutscenes *do* render full ultrawide.
+- **Upgrading from v1.0.x:** open v1.1.0 and patch again. It recognises the older patch, swaps
+  its three FOV edits for the projection fix, and keeps your aspect edits.
+- **v1.0.0's “Also widen combat & team-attack cameras” option was removed.** Checked against the
+  engine's own property data, its edits turned out not to be cameras at all: with the box
+  ticked, v1.0.0 changed an ocean wave's wind angle and the engine's default scene-capture FOV.
+  Patching again with v1.1.0 restores both values (**Revert** removes them too). The projection
+  fix now covers the team-attack cameras that option was meant for.
 
 ---
 
@@ -167,11 +185,16 @@ thus undo the patch). Just run the patcher again — it’s idempotent and re-ap
 - The patch **always backs up** the original first and can restore it byte-for-byte.
 - The byte edits are derived from, and unit-tested against, the known build:
   - clean baseline SHA-256 `F53C398936560D543F2AA8E6283733572FDF8AD7C14E03459C12E039CB1BD0BC`
-  - patched 3440×1440 (Hor+) SHA-256 `1EABCFFB09AE443521B42868E02EA126E3B346D48A859DB1021642891DA2FBBC`
-- A golden test confirms the patch engine reproduces the patched build **byte-for-byte**
-  from a clean baseline, and that revert restores the baseline.
-- On an unrecognised build the app falls back to signature search and warns; it never
-  guesses (a signature that matches more than once aborts the operation).
+  - patched 3440×1440 (v1.1.0, Hor+ on every camera) SHA-256 `9A2582F62C1E0142AA1B416DD3D9D403D32CC2EB6DA462FCEA5F4E2163F5C96C`
+- Golden tests confirm the patch engine reproduces that build **byte-for-byte** from a clean
+  baseline, that executables patched by v1.0.x upgrade to exactly the same bytes, and that
+  revert restores the baseline.
+- The projection fix was verified in-game by reading the rendered projection matrices live
+  (read-only) through a full boss fight: the regular 100° camera, the locked-on camera, special
+  attacks and every cutscene shot rendered at exactly their 16:9 vertical angle.
+- On an unrecognised build the app falls back to signature search; it never guesses — a
+  signature that matches more than once, or code that doesn't look exactly as expected, aborts
+  the operation.
 
 ---
 

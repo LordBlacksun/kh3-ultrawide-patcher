@@ -28,8 +28,8 @@ pub async fn inspect_path(path: String) -> Result<GameInfo, AppError> {
 }
 
 #[tauri::command]
-pub fn compute(width: u32, height: u32, fov: Option<f64>) -> ComputedValues {
-    crate::patch::compute_values(width, height, fov)
+pub fn compute(width: u32, height: u32) -> ComputedValues {
+    crate::patch::compute_values(width, height)
 }
 
 #[tauri::command]

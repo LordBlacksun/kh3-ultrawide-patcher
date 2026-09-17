@@ -15,8 +15,8 @@ export const detect = () => invoke<DetectResult>('detect');
 
 export const inspectPath = (path: string) => invoke<GameInfo>('inspect_path', { path });
 
-export const compute = (width: number, height: number, fov: number | null) =>
-	invoke<ComputedValues>('compute', { width, height, fov });
+export const compute = (width: number, height: number) =>
+	invoke<ComputedValues>('compute', { width, height });
 
 export const planPatch = (path: string, options: PatchOptions) =>
 	invoke<PatchPlan>('plan', { path, options });
